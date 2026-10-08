@@ -24,6 +24,10 @@ RESIDENT_BUDGET_GIB="${RESIDENT_BUDGET_GIB:-}"   # UD-Q4_K_XL: GiB of experts ke
 KV_STREAMING="${KV_STREAMING:-}" # auto | on | off; empty: setup.py's own default (auto)
 CONFIG="${CONFIG:-}"            # a config file to start with (wins over MODEL's /data/config/strata-<model>.json)
 
+# STRATA_CUDA (12 = the CUDA 12 engine image) needs no line here: setup.py reads it
+# from the environment as its --cuda default, so the setup pass below and every
+# REINSTALL use the engine this image was built with (engine-cuda12/, driver 525+).
+
 # setup.py starts the newest strata-*.json it finds, so link in exactly the one
 # this family and model were set up with. The config is the recorded output of
 # that setup (the pack, the profile, the quant, the KV decision), not settings
