@@ -14,7 +14,20 @@
 #   docker build -t strata .
 #   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
 #
-# Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
+# CUDA 12 (older NVIDIA driver: 525+ instead of 580+; docs/OLDER_GPUS.md): build the
+# image on a CUDA 12.9 base and stamp STRATA_CUDA=12 into it. The engine is then the
+# experimental CUDA 12 one, kept beside the CUDA 13 one's folder (engine-cuda12/) and
+# recorded as such in every model config, so starts and reinstalls keep using it:
+#   docker build -t strata:cuda12 \
+#     --build-arg CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04 \
+#     --build-arg STRATA_CUDA=12 .
+# STRATA_CUDA=12 in the image sets setup.py's --cuda default (its env fallback), so
+# the entry point's setup pass skips the 580 driver check and picks engine-cuda12/.
+# A CUDA 12 image runs on new drivers too, but keep new-driver hosts on the CUDA 13
+# image: RTX 50 (sm_120) engines built with CUDA 12.8 crashed on long prompts (#220).
+#
+# Run (host needs an NVIDIA driver >= 580, or >= 525 for the CUDA 12 image, and
+# nvidia-container-toolkit):
 #   docker run --rm --gpus all \
 #     -p 8080:8080 \
 #     --ulimit memlock=-1 \
@@ -26,6 +39,9 @@
 # VISION (no | yes | cpu), KV (int8 | q4_0 | k8v4), GPU (one card) or GPUS ("0,2"
 # or "all", with LAYER_SPLIT), LOW_RAM (auto | on | off), HOST, PORT, API_KEY,
 # GGUF_DIR (GGUF files you already have), RESIDENT_BUDGET_GIB, KV_STREAMING.
+# STRATA_CUDA (12 | 13) is not in the list below because the entry point never passes
+# it: it is baked into the image and setup.py reads it itself as the --cuda fallback,
+# so a setup pass inside the container uses the engine the image was built with.
 #
 # Only the model files, the prepared pack, the MTP layer and the install config
 # live in the /data volume; the engine is part of the image. Strata loads 32-62 GB
@@ -39,12 +55,23 @@
 # -e GPUS=0,2. A volume set up for one card switches to the pair on its first start
 # on a two-card host unless GPU or GPUS pins it. LOW_RAM=on runs on one card.
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+# The CUDA toolkit the engine is compiled with. 13.0.0 (the default) needs driver
+# 580+ on the host; 12.9.1 (STRATA_CUDA=12) needs 525+ and builds the experimental
+# CUDA 12 engine (docs/OLDER_GPUS.md). Keep the base's CUDA major in sync with
+# STRATA_CUDA: a 12 engine needs a 12.x nvcc, a 13 engine a 13.x one.
+ARG CUDA_IMAGE=nvidia/cuda:13.0.0-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
 
 # STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
 # and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
 # don't set it, keep spawning the server as a child.
+# STRATA_CUDA: the engine this image was built for (13 | 12). It is setup.py's env
+# fallback for --cuda, so every setup pass in the container (first start, REINSTALL)
+# uses that engine: the CUDA 12 one skips the 580 driver check (525 is enough) and
+# starts from engine-cuda12/. -e STRATA_CUDA= at run time clears it (setup's auto).
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=1
+ARG STRATA_CUDA=13
+ENV STRATA_CUDA=${STRATA_CUDA}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git libatomic1 libgomp1 \
@@ -55,7 +82,8 @@ WORKDIR /opt/strata
 COPY . .
 
 # RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
-# refuses anything below 75. BUILD_VISION=0 skips the image encoder build.
+# refuses anything below 75 (the CUDA 12 build adds -DSTRATA_EXPERIMENTAL_SM60=ON, which
+# admits Pascal/Volta). BUILD_VISION=0 skips the image encoder build.
 ARG CUDA_ARCHITECTURES=75;80;86;89;120
 ARG BUILD_VISION=1
 
@@ -73,28 +101,39 @@ RUN .venv/bin/python - <<'PYEOF'
 import json, os, pathlib, shutil
 import setup
 
+# STRATA_CUDA=12: the experimental CUDA 12 engine (docs/OLDER_GPUS.md) - a CUDA 12.x
+# toolkit, the folder setup.py keeps it in (engine-cuda12/), its "toolkit": 12 stamp
+# and its extra CMake definition, exactly the way build_engine(toolkit=12) does it,
+# so the first container start reuses it instead of compiling.
+toolkit = int(os.environ.get("STRATA_CUDA", "13") or 13)
 llama = setup.get_llama_cpp()
-nvcc, _ = setup.find_nvcc()
+nvcc, cuda_v = setup.find_nvcc(below=(13, 0)) if toolkit == 12 else setup.find_nvcc()
+if nvcc is None or int(cuda_v[0]) != toolkit:
+    raise SystemExit(f"STRATA_CUDA={toolkit} needs a CUDA {toolkit}.x toolkit in the base image"
+                     + (f"; found CUDA {cuda_v[0]}.{cuda_v[1]}" if nvcc else "; found none")
+                     + " (keep CUDA_IMAGE in sync with STRATA_CUDA, e.g. --build-arg"
+                     " CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04 --build-arg STRATA_CUDA=12)")
 arch = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;89;120").strip().strip('"').replace(",", ";")
+archs = [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()]
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
      f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
-     f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
+     f"-DSTRATA_GGML_DIR={llama}", *setup.engine_defs(archs, toolkit)], None, "build-strata.bat")
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=OFF",
          f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
-eng = setup.ROOT / "engine"
+eng = setup.engine_dir(toolkit)
 eng.mkdir(exist_ok=True)
 shutil.copy2(setup.ROOT / "build" / setup.EXE, eng / setup.EXE)
 if vision != "none":
     shutil.copy2(setup.ROOT / "build-vision" / "bin" / setup.VEXE, eng / setup.VEXE)
 bindir = pathlib.Path(nvcc).parent
-meta = {"source": "local", "version": setup.source_version(),
-        "archs": [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()], "vision": vision,
+meta = {"source": "local", "version": setup.source_version(), **({"toolkit": 12} if toolkit == 12 else {}),
+        "archs": archs, "vision": vision,
         "cuda_dirs": [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()],
         "src": setup.source_hash(setup.ENGINE_SOURCES),
         "vision_src": setup.source_hash(setup.VISION_SOURCES) if vision != "none" else None}
